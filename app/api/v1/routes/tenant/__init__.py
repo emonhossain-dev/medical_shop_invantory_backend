@@ -8,14 +8,24 @@ from app.api.v1.routes.tenant import (
     stock_adjustment,
     stock_transfer,
     supplier,
+    purchase_requisition,
+    stock_receipts,
+    stock_release,
+    current_stock
 )
 
 router = APIRouter()
-router.include_router(supplier.router)
 router.include_router(medicine.router)
+router.include_router(supplier.router)
 router.include_router(purchase.router)
+router.include_router(purchase_requisition.router)
+router.include_router(stock_receipts.router)
+router.include_router(stock_release.router)
+router.include_router(current_stock.router)
+
 router.include_router(stock_transfer.router)
 router.include_router(stock_adjustment.router)
+
 router.include_router(customer.router)
 
 router.include_router(Sale.router)

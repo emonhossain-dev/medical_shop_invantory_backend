@@ -54,12 +54,35 @@ class StaffRole(str, PyEnum):
 
 
 
+class RequisitionStatus(str, PyEnum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+    ordered = "ordered"
+    completed = "completed"
+    cancelled = "cancelled"
+
+
 class StockAdjustmentReason(str, PyEnum):
     purchase_return = "purchase_return"
     damage = "damage"
     expiry = "expiry"
     count_correction = "count_correction"
     other = "other"
+
+
+class StockReleaseReason(str, PyEnum):
+    """Why stock is being written off / adjusted (one reason per voucher)."""
+    damage = "damage"
+    expiry = "expiry"
+    supplier_return = "supplier_return"
+    count_correction = "count_correction"
+
+
+class StockReleaseDirection(str, PyEnum):
+    """out = stock leaves the shelf; in = count correction surplus only."""
+    out = "out"
+    in_ = "in"
 
 
 
@@ -741,3 +764,244 @@ class AnnouncementRead(Base):
     announcement_id: Mapped[int] = mapped_column(ForeignKey("announcements.id", ondelete="CASCADE"), nullable=False, index=True)
     store_member_id: Mapped[int] = mapped_column(ForeignKey("store_members.id", ondelete="CASCADE"), nullable=False, index=True)
     read_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default="now()")
+
+
+# ---------------------------------------------------------------------------
+# PURCHASE REQUISITION
+# ---------------------------------------------------------------------------
+#
+# workflow: staff creates (pending) -> admin approve/reject -> ordered -> completed
+# completed হওয়ার সময়ই আসল Purchase + PurchaseItem + StockBatch তৈরি হয়ে
+# stock এ quantity যোগ হয় (এখানেই stock "clear"/receive হয়)।
+#
+# ⚠️ DB migration দরকার — নতুন enum type আগে বানিয়ে নিন:
+#
+#   CREATE TYPE requisition_status AS ENUM (
+#       'pending', 'approved', 'rejected', 'ordered', 'completed', 'cancelled'
+#   );
+#
+# তারপর purchase_requisitions ও purchase_requisition_items টেবিল migrate করুন।
+
+class PurchaseRequisition(Base):
+    __tablename__ = "purchase_requisitions"
+    __table_args__ = (
+        Index("ix_requisitions_store_status", "store_id", "status"),
+        Index("ix_requisitions_store_branch", "store_id", "branch_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"), nullable=False, index=True)
+    branch_id: Mapped[int] = mapped_column(ForeignKey("branches.id", ondelete="CASCADE"), nullable=False, index=True)
+    supplier_id: Mapped[Optional[int]] = mapped_column(ForeignKey("suppliers.id", ondelete="SET NULL"))
+
+    requisition_no: Mapped[Optional[str]] = mapped_column(String(50))
+
+    status: Mapped[RequisitionStatus] = mapped_column(
+        SAEnum(RequisitionStatus, name="requisition_status", create_type=False),
+        nullable=False,
+        default=RequisitionStatus.pending,
+        index=True,
+    )
+
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    # --- requested (staff) ---
+    # NOT NULL কলাম, তাই ondelete=RESTRICT — requisition থাকা অবস্থায় requesting user delete করা যাবে না
+    requested_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default="now()")
+
+    # --- approved / rejected (admin) ---
+    approved_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    rejected_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text)
+
+    # --- ordered (admin -> supplier) ---
+    ordered_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    ordered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # --- completed (stock received) ---
+    completed_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # complete হওয়ার সময় যে আসল Purchase (invoice) তৈরি হয় সেটার লিংক
+    purchase_id: Mapped[Optional[int]] = mapped_column(ForeignKey("purchases.id", ondelete="SET NULL"), index=True)
+
+    # --- cancelled ---
+    cancelled_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    cancelled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default="now()")
+
+    items: Mapped[list["PurchaseRequisitionItem"]] = relationship(
+        back_populates="requisition", cascade="all, delete-orphan"
+    )
+
+
+class PurchaseRequisitionItem(Base):
+    __tablename__ = "purchase_requisition_items"
+    __table_args__ = (
+        Index("ix_requisition_items_requisition", "requisition_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    requisition_id: Mapped[int] = mapped_column(
+        ForeignKey("purchase_requisitions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"), nullable=False, index=True)
+    medicine_id: Mapped[int] = mapped_column(ForeignKey("medicines.id", ondelete="RESTRICT"), nullable=False)
+
+    quantity_requested: Mapped[int] = mapped_column(Integer, nullable=False)
+    # admin approve করার সময় চাইলে quantity adjust করতে পারবে (default = quantity_requested)
+    quantity_approved: Mapped[Optional[int]] = mapped_column(Integer)
+
+    # order দেওয়ার সময় আনুমানিক দাম (শুধু তথ্যের জন্য, চূড়ান্ত দাম complete এ বসবে)
+    estimated_unit_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
+
+    # --- এগুলো complete (stock receive) করার সময় পূরণ হয় ---
+    received_quantity: Mapped[Optional[int]] = mapped_column(Integer)
+    unit_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
+    sale_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
+    batch_no: Mapped[Optional[str]] = mapped_column(String(100))
+    expiry_date: Mapped[Optional[date]] = mapped_column(Date)
+
+    # complete হওয়ার সময় তৈরি হওয়া PurchaseItem এর সাথে লিংক
+    purchase_item_id: Mapped[Optional[int]] = mapped_column(ForeignKey("purchase_items.id", ondelete="SET NULL"))
+
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    requisition: Mapped["PurchaseRequisition"] = relationship(back_populates="items")
+
+
+class StockReceipt(Base):
+    __tablename__ = "stock_receipts"
+    __table_args__ = (
+        UniqueConstraint("store_id", "receipt_no", name="uq_store_receipt_no"),
+        UniqueConstraint("store_id", "idempotency_key", name="uq_store_receipt_idempotency"),
+        Index("ix_receipts_store_branch_date", "store_id", "branch_id", "received_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"), nullable=False, index=True)
+    branch_id: Mapped[int] = mapped_column(ForeignKey("branches.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Filled right after the first flush (id based) -> unique & race-safe
+    receipt_no: Mapped[Optional[str]] = mapped_column(String(50))
+
+    requisition_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("purchase_requisitions.id", ondelete="SET NULL"), index=True
+    )
+    supplier_id: Mapped[Optional[int]] = mapped_column(ForeignKey("suppliers.id", ondelete="SET NULL"), index=True)
+    purchase_id: Mapped[Optional[int]] = mapped_column(ForeignKey("purchases.id", ondelete="SET NULL"), index=True)
+
+    supplier_challan_no: Mapped[Optional[str]] = mapped_column(String(100))  # supplier's own challan / invoice no
+    received_date: Mapped[date] = mapped_column(Date, nullable=False, server_default=text("CURRENT_DATE"))
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Client-generated key (Idempotency-Key header) -> safe retries on flaky mobile networks
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(100))
+
+    received_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default="now()")
+
+    items: Mapped[list["StockReceiptItem"]] = relationship(
+        back_populates="receipt", cascade="all, delete-orphan", order_by="StockReceiptItem.id"
+    )
+
+
+class StockReceiptItem(Base):
+    __tablename__ = "stock_receipt_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receipt_id: Mapped[int] = mapped_column(ForeignKey("stock_receipts.id", ondelete="CASCADE"), nullable=False,
+                                            index=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"), nullable=False, index=True)
+    medicine_id: Mapped[int] = mapped_column(ForeignKey("medicines.id", ondelete="RESTRICT"), nullable=False)
+
+    requisition_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("purchase_requisition_items.id", ondelete="SET NULL"), index=True
+    )
+    stock_batch_id: Mapped[Optional[int]] = mapped_column(ForeignKey("stock_batches.id", ondelete="SET NULL"))
+    purchase_item_id: Mapped[Optional[int]] = mapped_column(ForeignKey("purchase_items.id", ondelete="SET NULL"))
+
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    sale_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    batch_no: Mapped[Optional[str]] = mapped_column(String(100))
+    expiry_date: Mapped[Optional[date]] = mapped_column(Date)
+    line_total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+
+    receipt: Mapped["StockReceipt"] = relationship(back_populates="items")
+
+
+class StockRelease(Base):
+    """
+    Stock write-off / adjustment voucher (damage, expiry, supplier return, count correction).
+    Stock is applied in the same transaction as the voucher is created.
+    """
+    __tablename__ = "stock_releases"
+    __table_args__ = (
+        UniqueConstraint("store_id", "release_no", name="uq_store_release_no"),
+        UniqueConstraint("store_id", "idempotency_key", name="uq_store_release_idempotency"),
+        Index("ix_releases_store_branch_date", "store_id", "branch_id", "released_date"),
+        Index("ix_releases_store_reason", "store_id", "reason"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"), nullable=False, index=True)
+    branch_id: Mapped[int] = mapped_column(ForeignKey("branches.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    release_no: Mapped[Optional[str]] = mapped_column(String(50))
+    reason: Mapped[str] = mapped_column(String(40), nullable=False)
+
+    released_date: Mapped[date] = mapped_column(Date, nullable=False, server_default=text("CURRENT_DATE"))
+    reference_no: Mapped[Optional[str]] = mapped_column(String(100))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    total_quantity_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_quantity_in: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_value: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(100))
+
+    released_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default="now()")
+
+    items: Mapped[list["StockReleaseItem"]] = relationship(
+        back_populates="release", cascade="all, delete-orphan", order_by="StockReleaseItem.id"
+    )
+
+
+class StockReleaseItem(Base):
+    __tablename__ = "stock_release_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    release_id: Mapped[int] = mapped_column(
+        ForeignKey("stock_releases.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"), nullable=False, index=True)
+    medicine_id: Mapped[int] = mapped_column(ForeignKey("medicines.id", ondelete="RESTRICT"), nullable=False)
+    stock_batch_id: Mapped[int] = mapped_column(ForeignKey("stock_batches.id", ondelete="RESTRICT"), nullable=False, index=True)
+
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    direction: Mapped[str] = mapped_column(String(8), nullable=False, default="out")
+    quantity_change: Mapped[int] = mapped_column(Integer, nullable=False)
+    quantity_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    quantity_after: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    line_value: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+
+    batch_no: Mapped[Optional[str]] = mapped_column(String(100))
+    expiry_date: Mapped[Optional[date]] = mapped_column(Date)
+
+    purchase_id: Mapped[Optional[int]] = mapped_column(ForeignKey("purchases.id", ondelete="SET NULL"), index=True)
+    purchase_item_id: Mapped[Optional[int]] = mapped_column(ForeignKey("purchase_items.id", ondelete="SET NULL"))
+    stock_adjustment_id: Mapped[Optional[int]] = mapped_column(ForeignKey("stock_adjustments.id", ondelete="SET NULL"))
+
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    release: Mapped["StockRelease"] = relationship(back_populates="items")
