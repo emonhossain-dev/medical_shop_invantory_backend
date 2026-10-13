@@ -1,7 +1,8 @@
 from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
-from app.models.all_models import StaffRole
+# NOTE: StaffRole enum আর ব্যবহার হচ্ছে না — StoreMember.role এখন Role object
+# (relationship, role_id FK থেকে), fixed enum না। তাই import সরিয়ে দিলাম।
 
 
 class BranchResponse(BaseModel):
@@ -15,12 +16,26 @@ class BranchResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class StoreMembershipResponse(BaseModel):
-    store_id: int
-    role: StaffRole
-    branch: Optional[BranchResponse] = None
+class RoleResponse(BaseModel):
+    id: int
+    name: str
+    slug: str
+    is_system: bool = False
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class StoreMembershipResponse(BaseModel):
+    store_id: int
+    role: RoleResponse
+    branch: Optional[BranchResponse] = None
+    # StoreMember.permission_codes (property) থেকে আসে -- role এর সব permission
+    # + per-member "extra" - per-member "revoke" (StoreMember.permissions JSONB)।
+    # validation_alias দিয়ে অ্যাট্রিবিউট নাম ম্যাপ করা হয়েছে যাতে StoreMember এর
+    # আসল "permissions" কলাম (JSONB override dict) এর সাথে নাম-সংঘর্ষ না হয়।
+    permissions: list[str] = Field(default_factory=list, validation_alias="permission_codes")
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
 class UserResponse(BaseModel):

@@ -7,7 +7,9 @@ from sqlalchemy.ext.asyncio import (
 )
 
 Base = declarative_base()
-engine = create_async_engine(DATABASE_URL)
+# pool_pre_ping: idle থাকার পর DB/NAT connection কেটে দিলে প্রথম request "connection is closed" এ ফেলত না
+# pool_recycle: লম্বা-জীবী connection ৩০ মিনিট পর নতুন করে
+engine = create_async_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=1800)
 AsyncSessionLocal = async_sessionmaker(
     engine,
     class_=AsyncSession,
@@ -17,4 +19,9 @@ AsyncSessionLocal = async_sessionmaker(
 
 async def get_db():
     async with AsyncSessionLocal() as session:
-        yield session
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise

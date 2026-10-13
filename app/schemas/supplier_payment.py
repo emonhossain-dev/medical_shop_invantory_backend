@@ -1,12 +1,9 @@
-# app/schemas/supplier_payment.py
-
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
-from typing import Optional
-
-from pydantic import BaseModel, Field, field_validator
-
+from typing import Literal, Optional
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from app.models.all_models import DuePaymentMethod
+
 
 
 class SupplierPaymentCreateRequest(BaseModel):
@@ -88,3 +85,94 @@ class SupplierPaymentUpdateRequest(BaseModel):
     method: Optional[DuePaymentMethod] = None
     reference_no: Optional[str] = None
     note: Optional[str] = None
+
+
+
+
+
+
+class SupplierDueItem(BaseModel):
+    """একটা supplier এর due summary — /suppliers/due লিস্টের প্রতিটা row"""
+    model_config = ConfigDict(from_attributes=True)
+
+    supplier_id: int
+    supplier_name: str
+    phone: Optional[str] = None
+
+    total_purchase_amount: Decimal
+    total_paid_amount: Decimal
+    total_due_amount: Decimal
+
+    # সবচেয়ে পুরনো unpaid purchase কবে হয়েছিল, আর তার থেকে আজ পর্যন্ত কত দিন
+    oldest_due_date: Optional[datetime] = None
+    oldest_due_days: Optional[int] = None
+
+
+class SupplierDueListResponse(BaseModel):
+    """GET /suppliers/due এর পুরো response — list + সাথে quick total"""
+    total_due_amount: Decimal
+    supplier_count: int
+    items: list[SupplierDueItem]
+
+
+class SupplierDueSummary(BaseModel):
+    """GET /suppliers/due/summary — সব supplier মিলিয়ে এক নম্বর"""
+    total_suppliers: int
+    suppliers_with_due: int
+    total_purchase_amount: Decimal
+    total_paid_amount: Decimal
+    total_due_amount: Decimal
+    generated_at: datetime
+
+
+class SupplierDueAgingItem(BaseModel):
+    """GET /suppliers/due/aging এর প্রতিটা row — supplier-wise aging bucket"""
+    model_config = ConfigDict(from_attributes=True)
+
+    supplier_id: int
+    supplier_name: str
+    phone: Optional[str] = None
+
+    current_0_30: Decimal
+    days_31_60: Decimal
+    days_61_90: Decimal
+    days_90_plus: Decimal
+    total_due_amount: Decimal
+
+    oldest_due_days: Optional[int] = None
+
+
+class SupplierDueAgingResponse(BaseModel):
+    """GET /suppliers/due/aging এর পুরো response"""
+    as_of: datetime
+    total_due_amount: Decimal
+    items: list[SupplierDueAgingItem]
+
+
+class SupplierLedgerEntry(BaseModel):
+    """Ledger-er ekta line: purchase, purchase-er somoy dewa taka, ba alada payment"""
+    transaction_date: datetime
+    type: Literal["purchase", "initial_payment", "payment"]
+    invoice_no: Optional[str] = None
+    purchase_id: Optional[int] = None
+    payment_id: Optional[int] = None
+    method: Optional[DuePaymentMethod] = None
+    reference_no: Optional[str] = None
+    note: Optional[str] = None
+    purchase_amount: Decimal = Decimal("0")   # purchase hole due barbe
+    paid_amount: Decimal = Decimal("0")       # payment hole due kombe
+    balance: Decimal                          # ei entry-r por supplier-er kache total due (negative = advance)
+
+
+class SupplierLedgerHistoryResponse(BaseModel):
+    """GET /suppliers/{supplier_id}/ledger/history"""
+    supplier_id: int
+    supplier_name: str
+    date_from: Optional[date] = None
+    date_to: Optional[date] = None
+    opening_balance: Decimal
+    total_purchase_amount: Decimal
+    total_paid_amount: Decimal
+    closing_balance: Decimal
+    total_entries: int
+    entries: list[SupplierLedgerEntry]

@@ -9,6 +9,7 @@ from app.core.database import get_db
 from app.depends.deps import get_current_store_member
 from app.models.all_models import Branch, StoreMember
 from app.schemas.current_stock import (
+    StockAlertListOut,
     StockDetailOut,
     StockListOut,
     StockStatus,
@@ -88,6 +89,19 @@ async def list_current_stock(
 @router.get("/summary", response_model=StockSummaryOut, summary="Stock dashboard totals")
 async def stock_summary(service: StockService = Depends(get_stock_service)):
     return await service.summary()
+
+
+@router.get("/alerts", response_model=StockAlertListOut, summary="Low & out-of-stock alert list")
+async def stock_alerts(
+    threshold: Optional[int] = Query(
+        None, ge=0, description="Flat override, যেমন 100. না দিলে যার যার reorder_level ব্যবহার হবে।"
+    ),
+    category: Optional[str] = Query(None, max_length=100),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    service: StockService = Depends(get_stock_service),
+):
+    return await service.list_alerts(threshold=threshold, category=category, skip=skip, limit=limit)
 
 
 @router.get(

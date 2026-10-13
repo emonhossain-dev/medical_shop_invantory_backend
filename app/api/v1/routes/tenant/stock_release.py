@@ -11,12 +11,12 @@ Send an Idempotency-Key header so a retry never writes stock off twice.
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.depends.deps import get_current_store_member, get_current_user
-from app.models.all_models import StaffRole, StockReleaseReason, StoreMember, User
+from app.depends.deps import get_current_user, require_permission
+from app.models.all_models import StockReleaseReason, StoreMember, User
 from app.schemas.stock_release import (
     PaginatedStockReleases,
     ReleasableBatchResponse,
@@ -27,21 +27,18 @@ from app.services.stock_release_service import StockReleaseService
 
 router = APIRouter(prefix="/stock-releases", tags=["Stock Release"])
 
-RELEASING_ROLES = (StaffRole.owner, StaffRole.manager, StaffRole.pharmacist)
-
-
-async def require_release_access(
-    current_user: User = Depends(get_current_user),
-    member: StoreMember = Depends(get_current_store_member),
-) -> StoreMember:
-    if current_user.is_super_admin:
-        return member
-    if member.role not in RELEASING_ROLES:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only owner, manager or pharmacist can release / write off stock",
-        )
-    return member
+# RBAC is module:action based now (Role -> Permission via RolePermission, plus
+# per-member extra/revoke overrides) — see app/depends/deps.py. StaffRole /
+# member.role no longer exist as an enum check; require_permission() already
+# handles the super_admin bypass and the 403 itself.
+#
+# IMPORTANT: PERMISSION_CATALOG (app/schemas/permissions.py) has no "stock_release"
+# module -- stock releases live under the single "stock" module, which already
+# defines a dedicated "release" action (PERMISSION_CATALOG["stock"] = CRUD +
+# ["adjust", "release"]). Using a module name outside the catalog means that
+# permission code is never seeded, so no role (other than owner, which bypasses
+# via "*") could ever be granted it -- that was the actual bug here.
+MODULE = "stock"
 
 
 def get_service(db: AsyncSession = Depends(get_db)) -> StockReleaseService:
@@ -65,7 +62,7 @@ async def create_stock_release(
     payload: StockReleaseCreateRequest,
     request: Request,
     idempotency_key: Optional[str] = Header(default=None, max_length=100),
-    member: StoreMember = Depends(require_release_access),
+    member: StoreMember = Depends(require_permission(MODULE, "release")),
     current_user: User = Depends(get_current_user),
     service: StockReleaseService = Depends(get_service),
 ):
@@ -87,7 +84,7 @@ async def list_stock_releases(
     q: Optional[str] = Query(default=None, max_length=100, description="Search release no / reference no"),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=20, ge=1, le=100),
-    member: StoreMember = Depends(require_release_access),
+    member: StoreMember = Depends(require_permission(MODULE, "read")),
     service: StockReleaseService = Depends(get_service),
 ):
     return await service.list_releases(
@@ -114,7 +111,7 @@ async def list_releasable_batches(
     expired_only: bool = False,
     in_stock_only: bool = True,
     limit: int = Query(default=50, ge=1, le=100),
-    member: StoreMember = Depends(require_release_access),
+    member: StoreMember = Depends(require_permission(MODULE, "read")),
     service: StockReleaseService = Depends(get_service),
 ):
     return await service.list_batches(
@@ -131,7 +128,7 @@ async def list_releasable_batches(
 @router.get("/{release_id}", response_model=StockReleaseResponse, summary="Stock release details")
 async def get_stock_release(
     release_id: int,
-    member: StoreMember = Depends(require_release_access),
+    member: StoreMember = Depends(require_permission(MODULE, "read")),
     service: StockReleaseService = Depends(get_service),
 ):
     return await service.get(release_id, member)

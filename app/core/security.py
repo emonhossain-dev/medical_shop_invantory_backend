@@ -26,7 +26,11 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(password.encode("utf-8"), hashed_password.encode("utf-8"))
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), hashed_password.encode("utf-8"))
+    except ValueError:
+        # bcrypt 5.x: >72 byte password বা malformed hash -> 500 না দিয়ে "mismatch"
+        return False
 
 
 # ============================================================
@@ -52,7 +56,7 @@ def encode_access(user_id: int, email: str) -> str:
 
 
 def decode_access(token: str) -> dict:
-    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={"require": ["exp", "sub"]})
     if payload.get("purpose") != "access":
         raise jwt.InvalidTokenError("This token cannot be used as an access token")
     return payload
@@ -89,7 +93,7 @@ def encode_refresh_token(user_id: int) -> str:
 
 
 def decode_refresh_token(token: str) -> dict:
-    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={"require": ["exp", "sub"]})
     if payload.get("purpose") != "refresh":
         raise jwt.InvalidTokenError("This token cannot be used as a refresh token")
     return payload

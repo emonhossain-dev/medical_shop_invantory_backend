@@ -5,18 +5,41 @@ from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
 from app.core.security import hash_password          # ← আপনার existing function
-from app.models.all_models import User, StoreMember, Branch, Subscription
+from app.models.all_models import User, StoreMember, Branch, Subscription, Role
 from app.models.all_models import StaffRole
 from app.schemas.store import StaffCreateRequest, StaffUpdateRequest, StaffResponse
-from app.depends.deps import get_current_store_member, require_store_admin, require_owner
+from app.depends.deps import get_current_store_member, require_permission
 
 router = APIRouter(prefix="/staff", tags=["Staff"])
+
+
+async def get_role_by_slug(db: AsyncSession, store_id: int, slug: str) -> Role:
+    """
+    StoreMember.role এখন সরাসরি StaffRole enum না — এটা `roles` টেবিলের
+    একটা row-এর সাথে (role_id দিয়ে) লিংকড। তাই StaffRole enum ভ্যালু (যেমন
+    "owner", "manager") থেকে ওই store-এর নিজস্ব Role row খুঁজে বের করতে হয়।
+    """
+    result = await db.execute(
+        select(Role).where(Role.store_id == store_id, Role.slug == slug)
+    )
+    role = result.scalar_one_or_none()
+    if not role:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Role '{slug}' not found for this store. Please create it first.",
+        )
+    return role
+
+
+def staff_role_value(role: Role) -> str:
+    """Role ORM object থেকে StaffResponse-এ পাঠানোর জন্য plain string বের করা।"""
+    return role.slug
 
 
 @router.post("", response_model=StaffResponse, status_code=201)
 async def add_staff(
     data: StaffCreateRequest,
-    member: StoreMember = Depends(require_store_admin),
+    member: StoreMember = Depends(require_permission("staff", "create")),
     db: AsyncSession = Depends(get_db),
 ):
     store_id = member.store_id
@@ -52,7 +75,7 @@ async def add_staff(
 
     if not user:
         # নতুন user তৈরি (temporary password)
-        temp_password = "ChangeMe123!"  # পরে invite system বানাতে পারেন
+        temp_password = "123456"  # পরে invite system বানাতে পারেন
         user = User(
             email=data.email,
             full_name=data.full_name,
@@ -84,24 +107,28 @@ async def add_staff(
         if not branch_check.scalar_one_or_none():
             raise HTTPException(status_code=400, detail="Invalid branch_id")
 
+    # StaffRole enum ভ্যালু (data.role) থেকে ওই store-এর আসল Role row বের করা
+    role_slug = data.role.value if hasattr(data.role, "value") else data.role
+    role_obj = await get_role_by_slug(db, store_id, role_slug)
+
     staff = StoreMember(
         store_id=store_id,
         user_id=user.id,
         branch_id=data.branch_id,
-        role=data.role,
+        role_id=role_obj.id,
         permissions=data.permissions,
         is_active=True,
     )
     db.add(staff)
     await db.commit()
-    await db.refresh(staff)
+    await db.refresh(staff, attribute_names=["role"])
 
     return StaffResponse(
         id=staff.id,
         store_id=staff.store_id,
         user_id=staff.user_id,
         branch_id=staff.branch_id,
-        role=staff.role,
+        role=staff_role_value(staff.role),
         permissions=staff.permissions,
         is_active=staff.is_active,
         created_at=staff.created_at,
@@ -132,7 +159,7 @@ async def list_staff(
                 store_id=s.store_id,
                 user_id=s.user_id,
                 branch_id=s.branch_id,
-                role=s.role,
+                role=staff_role_value(s.role),
                 permissions=s.permissions,
                 is_active=s.is_active,
                 created_at=s.created_at,
@@ -148,7 +175,7 @@ async def list_staff(
 async def update_staff(
     staff_id: int,
     data: StaffUpdateRequest,
-    member: StoreMember = Depends(require_store_admin),
+    member: StoreMember = Depends(require_permission("staff", "update")),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
@@ -164,11 +191,13 @@ async def update_staff(
         raise HTTPException(status_code=404, detail="Staff not found")
 
     # Owner নিজেকে demote করতে পারবে না
-    if staff.role == StaffRole.owner and data.role and data.role != StaffRole.owner:
+    if staff.role.slug == StaffRole.owner.value and data.role and data.role != StaffRole.owner:
         raise HTTPException(status_code=400, detail="Cannot change owner's role")
 
     if data.role is not None:
-        staff.role = data.role
+        role_slug = data.role.value if hasattr(data.role, "value") else data.role
+        role_obj = await get_role_by_slug(db, member.store_id, role_slug)
+        staff.role_id = role_obj.id
     if data.branch_id is not None:
         staff.branch_id = data.branch_id
     if data.permissions is not None:
@@ -177,14 +206,14 @@ async def update_staff(
         staff.is_active = data.is_active
 
     await db.commit()
-    await db.refresh(staff)
+    await db.refresh(staff, attribute_names=["role", "user"])
 
     return StaffResponse(
         id=staff.id,
         store_id=staff.store_id,
         user_id=staff.user_id,
         branch_id=staff.branch_id,
-        role=staff.role,
+        role=staff_role_value(staff.role),
         permissions=staff.permissions,
         is_active=staff.is_active,
         created_at=staff.created_at,
@@ -197,7 +226,7 @@ async def update_staff(
 @router.delete("/{staff_id}", status_code=204)
 async def remove_staff(
     staff_id: int,
-    member: StoreMember = Depends(require_owner),
+    member: StoreMember = Depends(require_permission("staff", "delete")),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
@@ -210,7 +239,7 @@ async def remove_staff(
     if not staff:
         raise HTTPException(status_code=404, detail="Staff not found")
 
-    if staff.role == StaffRole.owner:
+    if staff.role.slug == StaffRole.owner.value:
         raise HTTPException(status_code=400, detail="Cannot remove store owner")
 
     await db.delete(staff)

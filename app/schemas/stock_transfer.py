@@ -5,7 +5,7 @@ app/schemas/stock_transfer.py
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models.all_models import StockTransferStatus
 
@@ -15,8 +15,14 @@ class StockTransferCreateRequest(BaseModel):
     to_branch_id: int
     medicine_id: int
     stock_batch_id: int
-    quantity: int = Field(gt=0)
-    notes: Optional[str] = None
+    quantity: int = Field(gt=0, le=1_000_000)  # base unit-এ (StockBatch.quantity এর মতো)
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def _different_branches(self):
+        if self.from_branch_id == self.to_branch_id:
+            raise ValueError("from_branch_id and to_branch_id cannot be same")
+        return self
 
 
 class StockTransferResponse(BaseModel):
@@ -38,5 +44,4 @@ class StockTransferResponse(BaseModel):
     received_at: Optional[datetime] = None
     notes: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

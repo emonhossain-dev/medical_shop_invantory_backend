@@ -22,16 +22,63 @@ class StoreResponse(BaseModel):
     phone: Optional[str] = None
     status: StoreStatus
     trial_ends_at: Optional[datetime] = None
+
+    # ← নতুন যোগ করা হয়েছে: store settings (logo/invoice/currency/timezone)
+    logo_url: Optional[str] = None
+    invoice_template: Optional[str] = None
+    currency: str
+    timezone: str
+
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
 
 
+class StoreListItem(BaseModel):
+    id: int
+    name: str
+    slug: str
+    status: StoreStatus
+    logo_url: Optional[str] = None
+    role: str            # role slug, e.g. "owner", "senior-pharmacist"
+    role_id: int
+    role_name: str       # display name, e.g. "Owner"
+    is_owner: bool
+
+    model_config = {"from_attributes": True}
+
+
+
+
 class StoreUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=2, max_length=200)
     address: Optional[str] = None
     phone: Optional[str] = Field(None, max_length=20)
+    # logo/invoice_template/currency/timezone -- এগুলো এখন
+    # PUT /store/{id}/settings এর মাধ্যমে আলাদাভাবে update হয়, এখানে না।
+
+
+# -------------------- Store Settings (dedicated endpoint) --------------------
+# আলাদা করা হয়েছে যাতে /store/{id}/settings একটা independent, focused API
+# হয় -- চাইলে ভবিষ্যতে staff-দের এই জন্য আলাদা permission দেওয়া যাবে,
+# পুরো store profile edit করার permission না দিয়ে।
+class StoreSettingsResponse(BaseModel):
+    id: int
+    logo_url: Optional[str] = None
+    invoice_template: Optional[str] = None
+    currency: str
+    timezone: str
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class StoreSettingsUpdateRequest(BaseModel):
+    logo_url: Optional[str] = Field(None, max_length=500)
+    invoice_template: Optional[str] = Field(None, max_length=50)
+    currency: Optional[str] = Field(None, min_length=3, max_length=3)
+    timezone: Optional[str] = Field(None, max_length=50)
 
 # -------------------- Branch --------------------
 class BranchCreateRequest(BaseModel):

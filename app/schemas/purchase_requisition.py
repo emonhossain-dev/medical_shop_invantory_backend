@@ -4,7 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.models.all_models import RequisitionStatus
 
@@ -14,9 +14,28 @@ from app.models.all_models import RequisitionStatus
 # ---------------------------------------------------------------------------
 
 class RequisitionItemCreate(BaseModel):
-    medicine_id: int
+    # ঠিক একটা দিতে হবে: medicine_id (এই store এর Medicine.id) অথবা
+    # master_medicine_id (catalog; store এ না থাকলে auto-create)
+    medicine_id: Optional[int] = None
+    master_medicine_id: Optional[int] = None
+    # কোন unit-এ (Box/Pcs) requisition চাওয়া হচ্ছে — None দিলে medicine-এর
+    # base_unit_id ধরে নেওয়া হবে
+    unit_id: Optional[int] = None
+
+    # unit_id এই medicine-এর জন্য প্রথমবার ব্যবহার হলে দরকার — 1 unit_id = কত base unit।
+    # না দিলে আর unit_id নতুন হলে, server 422 + code="unit_needs_conversion_factor" দেবে।
+    conversion_factor: Optional[Decimal] = Field(
+        default=None, gt=0, max_digits=10, decimal_places=4
+    )
+
     quantity_requested: int = Field(gt=0)
     notes: Optional[str] = None
+
+    @model_validator(mode="after")
+    def exactly_one_medicine_ref(self):
+        if (self.medicine_id is None) == (self.master_medicine_id is None):
+            raise ValueError("Send exactly one of medicine_id or master_medicine_id")
+        return self
 
 
 class RequisitionCreateRequest(BaseModel):
@@ -70,6 +89,15 @@ class RequisitionOrderRequest(BaseModel):
 
 class RequisitionCompleteItem(BaseModel):
     item_id: int
+    # None দিলে requisition_item তৈরির সময়ের unit_id (বা তাও না থাকলে medicine.base_unit_id) ধরা হবে
+    unit_id: Optional[int] = None
+
+    # unit_id এই medicine-এর জন্য প্রথমবার ব্যবহার হলে দরকার — 1 unit_id = কত base unit।
+    # না দিলে আর unit_id নতুন হলে, server 422 + code="unit_needs_conversion_factor" দেবে।
+    conversion_factor: Optional[Decimal] = Field(
+        default=None, gt=0, max_digits=10, decimal_places=4
+    )
+
     received_quantity: int = Field(gt=0)
     unit_price: Decimal = Field(gt=0)
     sale_price: Decimal = Field(gt=0)
@@ -101,6 +129,8 @@ class RequisitionItemResponse(BaseModel):
     id: int
     medicine_id: int
     medicine_name: Optional[str] = None
+    unit_id: Optional[int] = None
+    unit_name: Optional[str] = None
     quantity_requested: int
     quantity_approved: Optional[int] = None
     estimated_unit_price: Optional[Decimal] = None

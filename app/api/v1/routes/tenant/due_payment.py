@@ -6,7 +6,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.depends.deps import get_current_user, get_current_store_member
+from app.depends.deps import get_current_user, get_current_store_member, require_permission
 from app.models.all_models import (
     Sale,
     DuePayment,
@@ -46,7 +46,7 @@ def _assert_branch_access(member: StoreMember, branch_id: Optional[int]) -> None
 @router.post("", response_model=DuePaymentCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_due_payment(
     payload: DuePaymentCreateRequest,
-    member: StoreMember = Depends(get_current_store_member),
+    member: StoreMember = Depends(require_permission("due_payments", "collect")),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -63,6 +63,12 @@ async def create_due_payment(
 
     # Branch check — cashier can only collect due for sales made in their own branch
     _assert_branch_access(member, sale.branch_id)
+
+    if payload.amount <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Amount must be greater than 0",
+        )
 
     if sale.due_amount <= 0:
         raise HTTPException(
@@ -113,7 +119,9 @@ async def create_due_payment(
 async def list_due_payments(
     sale_id: Optional[int] = None,
     customer_id: Optional[int] = None,
-    member: StoreMember = Depends(get_current_store_member),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    member: StoreMember = Depends(require_permission("due_payments", "read")),
     db: AsyncSession = Depends(get_db),
 ):
     # DuePayment itself doesn't carry branch_id, so join to Sale to scope it
@@ -131,7 +139,7 @@ async def list_due_payments(
     if customer_id is not None:
         query = query.where(DuePayment.customer_id == customer_id)
 
-    query = query.order_by(DuePayment.created_at.desc())
+    query = query.order_by(DuePayment.created_at.desc()).offset(skip).limit(limit)
 
     result = await db.execute(query)
     return result.scalars().all()
@@ -143,7 +151,7 @@ async def list_due_payments(
 @router.get("/{due_payment_id}", response_model=DuePaymentResponse)
 async def get_due_payment(
     due_payment_id: int,
-    member: StoreMember = Depends(get_current_store_member),
+    member: StoreMember = Depends(require_permission("due_payments", "read")),
     db: AsyncSession = Depends(get_db),
 ):
     query = (
@@ -171,7 +179,9 @@ async def get_due_payment(
 async def list_outstanding_sales(
     branch_id: Optional[int] = None,
     customer_id: Optional[int] = None,
-    member: StoreMember = Depends(get_current_store_member),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=1000),
+    member: StoreMember = Depends(require_permission("due_payments", "read")),
     db: AsyncSession = Depends(get_db),
 ):
     query = (
@@ -192,7 +202,7 @@ async def list_outstanding_sales(
     if customer_id is not None:
         query = query.where(Sale.customer_id == customer_id)
 
-    result = await db.execute(query)
+    result = await db.execute(query.offset(skip).limit(limit))
     return result.scalars().all()
 
 
@@ -200,7 +210,7 @@ async def list_outstanding_sales(
 async def get_customer_due_summary(
     customer_id: int,
     branch_id: Optional[int] = None,
-    member: StoreMember = Depends(get_current_store_member),
+    member: StoreMember = Depends(require_permission("due_payments", "read")),
     db: AsyncSession = Depends(get_db),
 ):
     customer_result = await db.execute(

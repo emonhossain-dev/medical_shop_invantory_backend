@@ -9,12 +9,21 @@ Two ways to receive stock:
 """
 
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models.all_models import DuePaymentMethod, RequisitionStatus
+
+
+_BD_TZ = ZoneInfo("Asia/Dhaka")
+
+
+def _today_bd() -> date:
+    """Bangladesh calendar date (server may run in UTC)."""
+    return datetime.now(_BD_TZ).date()
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +35,18 @@ class StockReceiptItemCreate(BaseModel):
     medicine_id: Optional[int] = Field(default=None, gt=0)          # medicines.id (store's own medicine)
     master_medicine_id: Optional[int] = Field(default=None, gt=0)   # master_medicines.id (auto-added to the store)
 
-    quantity: int = Field(gt=0, le=1_000_000)
+    # কোন unit-এ (Box/Pcs) receive হচ্ছে — None দিলে requisition_item এর unit_id,
+    # তাও না থাকলে medicine.base_unit_id ধরা হবে
+    unit_id: Optional[int] = Field(default=None, gt=0)
+
+    # unit_id এই medicine-এর জন্য প্রথমবার ব্যবহার হলে দরকার — 1 unit_id = কত base unit।
+    # না দিলে আর unit_id নতুন হলে, server 422 + code="unit_needs_conversion_factor" দেবে;
+    # সেই মান নিয়ে এই field সহ আবার একই request পাঠাও।
+    conversion_factor: Optional[Decimal] = Field(
+        default=None, gt=0, max_digits=12, decimal_places=4
+    )
+
+    quantity: int = Field(gt=0, le=1_000_000)  # উপরের unit_id অনুযায়ী raw quantity
     unit_price: Decimal = Field(ge=0, max_digits=10, decimal_places=2)  # ge=0 -> bonus / free goods allowed
     sale_price: Decimal = Field(gt=0, max_digits=10, decimal_places=2)
     batch_no: Optional[str] = Field(default=None, max_length=100)
@@ -43,7 +63,7 @@ class StockReceiptItemCreate(BaseModel):
     @field_validator("expiry_date")
     @classmethod
     def _expiry_must_be_future(cls, v: Optional[date]) -> Optional[date]:
-        if v is not None and v <= date.today():
+        if v is not None and v <= _today_bd():
             raise ValueError("expiry_date must be in the future (expired stock cannot be received)")
         return v
 
@@ -84,7 +104,7 @@ class StockReceiptCreateRequest(BaseModel):
     @field_validator("received_date")
     @classmethod
     def _not_in_future(cls, v: Optional[date]) -> Optional[date]:
-        if v is not None and v > date.today():
+        if v is not None and v > _today_bd():
             raise ValueError("received_date cannot be in the future")
         return v
 
@@ -123,7 +143,12 @@ class StockReceiptItemResponse(BaseModel):
     purchase_item_id: Optional[int] = None
     batch_no: Optional[str] = None
     expiry_date: Optional[date] = None
-    quantity: int
+
+    unit_id: Optional[int] = None
+    unit_name: Optional[str] = None
+    quantity_in_unit: Optional[int] = None  # যে unit-এ receive হয়েছিল
+
+    quantity: int  # base_unit-এ normalize করা quantity — StockBatch এখানেই বসে
     unit_price: Decimal
     sale_price: Decimal
     line_total: Decimal
@@ -191,6 +216,8 @@ class OutstandingItemResponse(BaseModel):
     requisition_item_id: int
     medicine_id: int
     medicine_name: Optional[str] = None
+    unit_id: Optional[int] = None
+    unit_name: Optional[str] = None
     quantity_ordered: int      # approved qty (falls back to requested qty)
     quantity_received: int
     quantity_outstanding: int
@@ -226,5 +253,6 @@ class MedicineSearchResult(BaseModel):
     strength: Optional[str] = None
     dosage_form: Optional[str] = None
     manufacturer: Optional[str] = None
-    unit: Optional[str] = None
+    base_unit_id: Optional[int] = None
+    base_unit_name: Optional[str] = None
     reference_sale_price: Optional[Decimal] = None  # master only: handy to pre-fill sale_price

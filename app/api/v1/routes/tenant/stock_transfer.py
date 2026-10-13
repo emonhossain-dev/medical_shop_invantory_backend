@@ -19,7 +19,7 @@ row lock নেওয়া হয় —
      concurrent sale/transfer/return থেকে lost-update না হয়
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.core.database import get_db
-from app.depends.deps import get_current_store_member, require_store_admin
+from app.depends.deps import get_current_store_member, require_permission
 from app.models.all_models import (
     Branch,
     Medicine,
@@ -36,6 +36,8 @@ from app.models.all_models import (
     StockTransferStatus,
     StoreMember,
 )
+from app.services.branch_scope import assert_branch_access
+from app.services.date_utils import dhaka_today
 from app.schemas.stock_transfer import (
     StockTransferCreateRequest,
     StockTransferResponse,
@@ -60,6 +62,15 @@ async def _get_transfer_or_404(
     if transfer is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Stock transfer not found")
     return transfer
+
+
+def _assert_involved(member: StoreMember, transfer: StockTransfer) -> None:
+    """branch-bound staff শুধু সেই transfer ছুঁতে পারবে যেটা তার branch এর সাথে জড়িত।"""
+    if member.branch_id is not None and member.branch_id not in (
+        transfer.from_branch_id,
+        transfer.to_branch_id,
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You don't have access to this transfer")
 
 
 async def _get_batch_for_update(db: AsyncSession, batch_id: int, store_id: int) -> StockBatch | None:
@@ -108,11 +119,18 @@ async def _build_response(db: AsyncSession, transfer: StockTransfer) -> StockTra
 @router.post("", response_model=StockTransferResponse, status_code=status.HTTP_201_CREATED)
 async def create_stock_transfer(
     payload: StockTransferCreateRequest,
-    member: StoreMember = Depends(require_store_admin),
+    member: StoreMember = Depends(require_permission("stock_transfers", "create")),
     db: AsyncSession = Depends(get_db),
 ):
     if payload.from_branch_id == payload.to_branch_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "from_branch_id and to_branch_id cannot be same")
+
+    # branch-bound staff শুধু নিজের branch থেকে (বা নিজের branch এ) transfer request করতে পারবে
+    if member.branch_id is not None and member.branch_id not in (
+        payload.from_branch_id,
+        payload.to_branch_id,
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only create transfers involving your own branch")
 
     from_branch = await db.scalar(
         select(Branch).where(
@@ -148,6 +166,12 @@ async def create_stock_transfer(
     if batch is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid stock_batch_id for this medicine/branch")
 
+    if batch.expiry_date is not None and batch.expiry_date < dhaka_today():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Batch {batch.batch_no or batch.id} expired on {batch.expiry_date}; expired stock cannot be transferred",
+        )
+
     if batch.quantity < payload.quantity:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -178,13 +202,15 @@ async def create_stock_transfer(
 @router.post("/{transfer_id}/dispatch", response_model=StockTransferResponse)
 async def dispatch_stock_transfer(
     transfer_id: int,
-    member: StoreMember = Depends(require_store_admin),
+    member: StoreMember = Depends(require_permission("stock_transfers", "update")),
     db: AsyncSession = Depends(get_db),
 ):
     # transfer row lock — একই transfer এ দুইটা concurrent dispatch call এলে
     # দ্বিতীয়টা প্রথমটার commit পর্যন্ত block হয়ে থাকবে, ফলে status check
     # সবসময় up-to-date state এর উপর হবে (double-dispatch ঠেকায়)
     transfer = await _get_transfer_or_404(db, transfer_id, member.store_id, for_update=True)
+
+    assert_branch_access(member, transfer.from_branch_id)  # source branch ই dispatch করবে
 
     if transfer.status != StockTransferStatus.pending:
         raise HTTPException(
@@ -195,6 +221,12 @@ async def dispatch_stock_transfer(
     batch = await _get_batch_for_update(db, transfer.stock_batch_id, member.store_id)
     if batch is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Source stock batch no longer exists")
+
+    if batch.expiry_date is not None and batch.expiry_date < dhaka_today():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Batch {batch.batch_no or batch.id} expired on {batch.expiry_date}; expired stock cannot be transferred",
+        )
 
     if batch.quantity < transfer.quantity:
         raise HTTPException(
@@ -216,10 +248,12 @@ async def dispatch_stock_transfer(
 @router.post("/{transfer_id}/receive", response_model=StockTransferResponse)
 async def receive_stock_transfer(
     transfer_id: int,
-    member: StoreMember = Depends(require_store_admin),
+    member: StoreMember = Depends(require_permission("stock_transfers", "receive")),
     db: AsyncSession = Depends(get_db),
 ):
     transfer = await _get_transfer_or_404(db, transfer_id, member.store_id, for_update=True)
+
+    assert_branch_access(member, transfer.to_branch_id)  # destination branch ই receive করবে
 
     if transfer.status != StockTransferStatus.in_transit:
         raise HTTPException(
@@ -242,9 +276,13 @@ async def receive_stock_transfer(
             StockBatch.store_id == member.store_id,
             StockBatch.branch_id == transfer.to_branch_id,
             StockBatch.medicine_id == transfer.medicine_id,
-            StockBatch.batch_no == source_batch.batch_no,
-            StockBatch.expiry_date == source_batch.expiry_date,
+            StockBatch.batch_no.is_not_distinct_from(source_batch.batch_no),
+            StockBatch.expiry_date.is_not_distinct_from(source_batch.expiry_date),
+            StockBatch.purchase_price == source_batch.purchase_price,
+            StockBatch.sale_price == source_batch.sale_price,
         )
+        .order_by(StockBatch.id)
+        .limit(1)  # receipts প্রতি লাইনে নতুন batch বানায় -> একাধিক match থাকতে পারে
         .with_for_update()
     )
     if dest_batch is not None:
@@ -264,7 +302,7 @@ async def receive_stock_transfer(
 
     transfer.status = StockTransferStatus.received
     transfer.received_by = member.user_id
-    transfer.received_at = datetime.utcnow()
+    transfer.received_at = datetime.now(timezone.utc)
 
     await db.commit()
     await db.refresh(transfer)
@@ -277,10 +315,12 @@ async def receive_stock_transfer(
 @router.post("/{transfer_id}/cancel", response_model=StockTransferResponse)
 async def cancel_stock_transfer(
     transfer_id: int,
-    member: StoreMember = Depends(require_store_admin),
+    member: StoreMember = Depends(require_permission("stock_transfers", "cancel")),
     db: AsyncSession = Depends(get_db),
 ):
     transfer = await _get_transfer_or_404(db, transfer_id, member.store_id, for_update=True)
+
+    _assert_involved(member, transfer)
 
     if transfer.status not in (StockTransferStatus.pending, StockTransferStatus.in_transit):
         raise HTTPException(
@@ -291,8 +331,13 @@ async def cancel_stock_transfer(
     if transfer.status == StockTransferStatus.in_transit:
         # dispatch এর সময় source batch থেকে quantity কাটা হয়েছিল, cancel করলে ফেরত দিতে হবে
         batch = await _get_batch_for_update(db, transfer.stock_batch_id, member.store_id)
-        if batch is not None:
-            batch.quantity += transfer.quantity
+        if batch is None:
+            # আগে এখানে চুপচাপ skip হতো -> stock হারিয়ে যেত
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Source stock batch no longer exists; cannot return in-transit stock. Contact admin.",
+            )
+        batch.quantity += transfer.quantity
 
     transfer.status = StockTransferStatus.canceled
 
@@ -309,7 +354,9 @@ async def list_stock_transfers(
     branch_id: int | None = Query(default=None, description="from_branch_id অথবা to_branch_id হিসেবে filter করে"),
     medicine_id: int | None = Query(default=None),
     status_filter: StockTransferStatus | None = Query(default=None, alias="status"),
-    member: StoreMember = Depends(get_current_store_member),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    member: StoreMember = Depends(require_permission("stock_transfers", "read")),
     db: AsyncSession = Depends(get_db),
 ):
     from_b = aliased(Branch)
@@ -325,6 +372,10 @@ async def list_stock_transfers(
         .order_by(StockTransfer.requested_at.desc())
     )
 
+    if member.branch_id is not None:
+        if branch_id is not None and branch_id != member.branch_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only view your own branch's transfers")
+        branch_id = member.branch_id
     if branch_id is not None:
         query = query.where(
             (StockTransfer.from_branch_id == branch_id) | (StockTransfer.to_branch_id == branch_id)
@@ -334,7 +385,7 @@ async def list_stock_transfers(
     if status_filter is not None:
         query = query.where(StockTransfer.status == status_filter)
 
-    result = await db.execute(query)
+    result = await db.execute(query.offset(skip).limit(limit))
 
     return [
         StockTransferResponse(
@@ -366,8 +417,9 @@ async def list_stock_transfers(
 @router.get("/{transfer_id}", response_model=StockTransferResponse)
 async def get_stock_transfer(
     transfer_id: int,
-    member: StoreMember = Depends(get_current_store_member),
+    member: StoreMember = Depends(require_permission("stock_transfers", "read")),
     db: AsyncSession = Depends(get_db),
 ):
     transfer = await _get_transfer_or_404(db, transfer_id, member.store_id)
+    _assert_involved(member, transfer)
     return await _build_response(db, transfer)

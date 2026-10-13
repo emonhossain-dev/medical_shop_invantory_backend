@@ -1,7 +1,3 @@
-"""
-app/schemas/stock_adjustment.py
-"""
-
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional

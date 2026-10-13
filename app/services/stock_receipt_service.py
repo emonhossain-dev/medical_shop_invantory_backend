@@ -15,6 +15,7 @@ Any failure rolls everything back, so stock and money can never get out of sync.
 
 from collections import defaultdict
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from typing import Optional
 
@@ -41,6 +42,7 @@ from app.models.all_models import (
     StoreMember,
     Supplier,
     SupplierPayment,
+    Unit,
     User,
 )
 from app.schemas.stock_receipt import (
@@ -53,8 +55,23 @@ from app.schemas.stock_receipt import (
     StockReceiptListItemResponse,
     StockReceiptResponse,
 )
+from app.services.unit_service import (
+    create_medicine_with_base_unit,
+    load_medicine_units,
+    load_unit_map,
+    price_per_base,
+    resolve_or_create_unit_for_receiving,
+    to_base_quantity,
+)
 
 TWO_PLACES = Decimal("0.01")
+
+_BD_TZ = ZoneInfo("Asia/Dhaka")
+
+
+def _today_bd() -> date:
+    """Bangladesh calendar date (server may run in UTC)."""
+    return datetime.now(_BD_TZ).date()
 
 
 def _bad_request(detail: str) -> HTTPException:
@@ -219,8 +236,6 @@ class StockReceiptService:
 
         # ---- 2. Resolve every line to a medicine --------------------------------
         resolved: list[tuple] = []  # (line, medicine_id, requisition_item | None)
-        incoming_per_item: dict[int, int] = defaultdict(int)
-        last_line_for_item: dict[int, object] = {}
         seen_batches: set[tuple] = set()
         master_cache: dict[int, int] = {}  # master_medicine_id -> store medicine id
 
@@ -236,8 +251,6 @@ class StockReceiptService:
                 if line.medicine_id is not None and line.medicine_id != req_item.medicine_id:
                     raise _bad_request(f"Line {idx}: medicine_id does not match the requisition item")
                 medicine_id = req_item.medicine_id
-                incoming_per_item[req_item.id] += line.quantity
-                last_line_for_item[req_item.id] = line
             elif line.master_medicine_id is not None:
                 medicine_id = await self._medicine_from_master(
                     store_id, line.master_medicine_id, master_cache, idx
@@ -258,15 +271,17 @@ class StockReceiptService:
             resolved.append((line, medicine_id, req_item))
 
         # ---- 3. Validate medicines (store-scoped, active) -----------------------
+        # Full ORM objects (not just columns) -- resolve_or_create_unit_for_receiving
+        # needs medicine.base_unit_id and medicine.name below.
         medicine_ids = {m for _, m, _ in resolved}
         med_rows = (
             await self.db.execute(
-                select(Medicine.id, Medicine.name, Medicine.is_active).where(
+                select(Medicine).where(
                     Medicine.store_id == store_id, Medicine.id.in_(medicine_ids)
                 )
             )
-        ).all()
-        medicines = {r.id: r for r in med_rows}
+        ).scalars().all()
+        medicines: dict[int, Medicine] = {m.id: m for m in med_rows}
         for mid in medicine_ids:
             med = medicines.get(mid)
             if med is None:
@@ -277,17 +292,76 @@ class StockReceiptService:
             if not med.is_active:
                 raise _bad_request(f"Medicine '{med.name}' is inactive and cannot be received")
 
-        # ---- 4. Over-receipt protection ----------------------------------------
-        for item_id, qty in incoming_per_item.items():
+        # ---- 4. Resolve unit per line -> base-unit quantity & price -------------
+        # unit_id priority per line: line.unit_id > requisition item's unit_id > medicine.base_unit_id.
+        # A pack size never configured before (e.g. a supplier's new "Box of 50") is configured
+        # on the fly when the client sends conversion_factor; otherwise a 422 asks for it.
+        line_unit_ids: list[int] = []
+        for line, medicine_id, req_item in resolved:
+            uid = line.unit_id
+            if uid is None and req_item is not None:
+                uid = req_item.unit_id
+            if uid is None:
+                uid = medicines[medicine_id].base_unit_id
+            line_unit_ids.append(uid)
+
+        # requisition item-এর quantity_approved / received_quantity সব ঐ item-এর unit-এ (model comment),
+        # তাই requisition mode-এ line অবশ্যই একই unit-এ receive হতে হবে — নাহলে Box vs Pcs মিশে যায়।
+        for (line, medicine_id, req_item), uid in zip(resolved, line_unit_ids):
+            if req_item is not None:
+                expected_uid = req_item.unit_id or medicines[medicine_id].base_unit_id
+                if uid != expected_uid:
+                    raise _bad_request(
+                        f"'{medicines[medicine_id].name}' was ordered in unit_id {expected_uid}; "
+                        f"receive it in the same unit (got unit_id {uid})"
+                    )
+
+        unit_map = await load_unit_map(self.db, store_id, line_unit_ids)
+        mu_map = await load_medicine_units(self.db, medicine_ids)
+
+        resolved_units: list = []  # ResolvedUnit per line, same order as `resolved`
+        base_quantities: list[int] = []
+        base_unit_prices: list[Decimal] = []
+        base_sale_prices: list[Decimal] = []
+        incoming_per_item: dict[int, int] = defaultdict(int)  # requisition_item_id -> qty in the item's unit
+        last_line_for_item: dict[int, object] = {}
+
+        for (line, medicine_id, req_item), unit_id in zip(resolved, line_unit_ids):
+            ru = await resolve_or_create_unit_for_receiving(
+                self.db,
+                store_id,
+                medicines[medicine_id],
+                unit_id,
+                unit_map,
+                mu_map,
+                conversion_factor=line.conversion_factor,
+                # 422 এ client-এর নিজের id echo হবে (master line হলে master id) -> retry loop হবে না
+                requested_medicine_id=line.master_medicine_id or line.medicine_id or medicine_id,
+            )
+            base_qty = to_base_quantity(line.quantity, ru.factor)
+            resolved_units.append(ru)
+            base_quantities.append(base_qty)
+            base_unit_prices.append(price_per_base(line.unit_price, ru.factor))
+            base_sale_prices.append(price_per_base(line.sale_price, ru.factor))
+
+            if req_item is not None:
+                incoming_per_item[req_item.id] += line.quantity  # item-এর unit-এ
+                last_line_for_item[req_item.id] = line
+
+        # ---- 5. Over-receipt protection (compared in the requisition item's unit) ---
+        for item_id, base_qty in incoming_per_item.items():
             ri = req_items[item_id]
             outstanding = _approved_qty(ri) - (ri.received_quantity or 0)
-            if qty > outstanding:
+            if base_qty > outstanding:
+                _u = unit_map.get(ri.unit_id or medicines[ri.medicine_id].base_unit_id)
                 raise _bad_request(
                     f"Over-receipt for '{medicines[ri.medicine_id].name}': "
-                    f"outstanding {outstanding}, but {qty} was submitted"
+                    f"outstanding {outstanding} {_u.name if _u else ''}, but {base_qty} was submitted"
                 )
 
-        # ---- 5. Money -----------------------------------------------------------
+        # ---- 6. Money -------------------------------------------------------------
+        # unit_price/sale_price on the line are "per the unit it was received in" (e.g. per Box);
+        # line_total uses that raw price × raw quantity, which equals base_price × base_qty.
         line_totals = [_money(line.unit_price * line.quantity) for line, _, _ in resolved]
         total_amount = sum(line_totals, Decimal("0.00"))
         paid_amount = _money(payload.paid_amount)
@@ -297,9 +371,9 @@ class StockReceiptService:
         if paid_amount > 0 and supplier_id is None:
             raise _bad_request("A supplier is required to record a payment")
 
-        received_date = payload.received_date or date.today()
+        received_date = payload.received_date or _today_bd()
 
-        # ---- 6. Purchase (financial record) -------------------------------------
+        # ---- 7. Purchase (financial record) -------------------------------------
         purchase = Purchase(
             store_id=store_id,
             branch_id=branch_id,
@@ -314,7 +388,7 @@ class StockReceiptService:
         # Replace with your existing invoice-number helper if you already have one.
         purchase.invoice_no = f"PUR-{received_date:%Y%m%d}-{purchase.id:06d}"
 
-        # ---- 7. Receipt header --------------------------------------------------
+        # ---- 8. Receipt header --------------------------------------------------
         receipt = StockReceipt(
             store_id=store_id,
             branch_id=branch_id,
@@ -332,40 +406,48 @@ class StockReceiptService:
         await self.db.flush()  # may raise IntegrityError on a duplicate idempotency key
         receipt.receipt_no = f"GRN-{received_date:%Y%m}-{receipt.id:06d}"
 
-        # ---- 8. StockBatch per line (this is what adds stock) -------------------
+        # ---- 9. StockBatch per line (this is what adds stock; always base-unit) ----
         batches: list[StockBatch] = []
-        for line, medicine_id, _ in resolved:
+        for (line, medicine_id, _), base_qty, base_price, base_sale in zip(
+            resolved, base_quantities, base_unit_prices, base_sale_prices
+        ):
             batch = StockBatch(
                 store_id=store_id,
                 branch_id=branch_id,
                 medicine_id=medicine_id,
                 batch_no=line.batch_no,
-                quantity=line.quantity,
-                purchase_price=line.unit_price,
-                sale_price=line.sale_price,
+                quantity=base_qty,
+                purchase_price=base_price,
+                sale_price=base_sale,
                 expiry_date=line.expiry_date,
             )
             self.db.add(batch)
             batches.append(batch)
         await self.db.flush()  # batch ids are needed below
 
-        # ---- 9. PurchaseItem + StockReceiptItem per line -------------------------
+        # ---- 10. PurchaseItem + StockReceiptItem per line -------------------------
+        # unit_price/sale_price stored here are the ORIGINAL per-received-unit prices
+        # (e.g. per Box) for display; StockBatch above already holds the base-unit price.
         purchase_items: list[PurchaseItem] = []
-        for (line, medicine_id, _), batch in zip(resolved, batches):
+        for (line, medicine_id, _), batch, ru, base_qty in zip(
+            resolved, batches, resolved_units, base_quantities
+        ):
             p_item = PurchaseItem(
                 purchase_id=purchase.id,
                 store_id=store_id,
                 medicine_id=medicine_id,
                 stock_batch_id=batch.id,
-                quantity=line.quantity,
+                unit_id=ru.unit_id,
+                quantity_in_unit=line.quantity,
+                quantity=base_qty,
                 unit_price=line.unit_price,
             )
             self.db.add(p_item)
             purchase_items.append(p_item)
         await self.db.flush()
 
-        for (line, medicine_id, req_item), batch, p_item, line_total in zip(
-            resolved, batches, purchase_items, line_totals
+        for (line, medicine_id, req_item), batch, p_item, ru, base_qty, line_total in zip(
+            resolved, batches, purchase_items, resolved_units, base_quantities, line_totals
         ):
             self.db.add(
                 StockReceiptItem(
@@ -375,7 +457,9 @@ class StockReceiptService:
                     requisition_item_id=req_item.id if req_item else None,
                     stock_batch_id=batch.id,
                     purchase_item_id=p_item.id,
-                    quantity=line.quantity,
+                    unit_id=ru.unit_id,
+                    quantity_in_unit=line.quantity,
+                    quantity=base_qty,
                     unit_price=line.unit_price,
                     sale_price=line.sale_price,
                     batch_no=line.batch_no,
@@ -384,7 +468,7 @@ class StockReceiptService:
                 )
             )
 
-        # ---- 10. Supplier payment (optional) ------------------------------------
+        # ---- 11. Supplier payment (optional) ------------------------------------
         if paid_amount > 0:
             self.db.add(
                 SupplierPayment(
@@ -399,7 +483,7 @@ class StockReceiptService:
                 )
             )
 
-        # ---- 11. Update the requisition -----------------------------------------
+        # ---- 12. Update the requisition -----------------------------------------
         if requisition is not None:
             for item_id, qty in incoming_per_item.items():
                 ri = req_items[item_id]
@@ -420,7 +504,7 @@ class StockReceiptService:
             if requisition.purchase_id is None:
                 requisition.purchase_id = purchase.id
 
-        # ---- 12. Audit trail -----------------------------------------------------
+        # ---- 13. Audit trail -----------------------------------------------------
         self.db.add(
             AuditLog(
                 store_id=store_id,
@@ -478,14 +562,16 @@ class StockReceiptService:
                 raise _bad_request(f"Line {idx}: master medicine {master_id} not found")
 
             name = f"{master.brand_name} {master.strength}".strip() if master.strength else master.brand_name
-            medicine = Medicine(
-                store_id=store_id,
+            # create_medicine_with_base_unit() sets base_unit_id (global/store 'Pcs' by default)
+            # and the matching base MedicineUnit(conversion_factor=1) row. Without this,
+            # medicine.base_unit_id would be None and unit resolution below would break.
+            medicine = await create_medicine_with_base_unit(
+                self.db,
+                store_id,
                 name=name[:200],
                 generic_name=master.generic_name,
                 master_medicine_id=master.id,
             )
-            self.db.add(medicine)
-            await self.db.flush()
             medicine_id = medicine.id
 
         cache[master_id] = medicine_id
@@ -547,6 +633,14 @@ class StockReceiptService:
                 ).scalars().all()
             )
 
+        unit_names: dict[int, str] = {}
+        base_ids = {m.base_unit_id for m in store_rows}
+        if base_ids:
+            unit_names = {
+                r.id: r.name
+                for r in await self.db.execute(select(Unit.id, Unit.name).where(Unit.id.in_(base_ids)))
+            }
+
         results: list[MedicineSearchResult] = [
             MedicineSearchResult(
                 source="store",
@@ -554,7 +648,8 @@ class StockReceiptService:
                 master_medicine_id=m.master_medicine_id,
                 name=m.name,
                 generic_name=m.generic_name,
-                unit=m.unit,
+                base_unit_id=m.base_unit_id,
+                base_unit_name=unit_names.get(m.base_unit_id),
             )
             for m in store_rows
         ]
@@ -602,6 +697,12 @@ class StockReceiptService:
         if med_ids:
             rows = await db.execute(select(Medicine.id, Medicine.name).where(Medicine.id.in_(med_ids)))
             med_names = {r.id: r.name for r in rows}
+
+        unit_ids = {i.unit_id for i in receipt.items if i.unit_id is not None}
+        unit_names: dict[int, str] = {}
+        if unit_ids:
+            rows = await db.execute(select(Unit.id, Unit.name).where(Unit.id.in_(unit_ids)))
+            unit_names = {r.id: r.name for r in rows}
 
         supplier_name = None
         if receipt.supplier_id:
@@ -666,6 +767,9 @@ class StockReceiptService:
                     purchase_item_id=i.purchase_item_id,
                     batch_no=i.batch_no,
                     expiry_date=i.expiry_date,
+                    unit_id=i.unit_id,
+                    unit_name=unit_names.get(i.unit_id) if i.unit_id else None,
+                    quantity_in_unit=i.quantity_in_unit,
                     quantity=i.quantity,
                     unit_price=i.unit_price,
                     sale_price=i.sale_price,
@@ -781,7 +885,7 @@ class StockReceiptService:
 
         rows = (
             await self.db.execute(
-                select(PurchaseRequisitionItem, Medicine.name)
+                select(PurchaseRequisitionItem, Medicine.name, Medicine.base_unit_id)
                 .join(Medicine, Medicine.id == PurchaseRequisitionItem.medicine_id)
                 .where(PurchaseRequisitionItem.requisition_id == requisition.id)
                 .order_by(PurchaseRequisitionItem.id)
@@ -792,8 +896,13 @@ class StockReceiptService:
         if requisition.supplier_id:
             supplier_name = await self.db.scalar(select(Supplier.name).where(Supplier.id == requisition.supplier_id))
 
+        unit_map = await load_unit_map(
+            self.db, member.store_id, [ri.unit_id or base_uid for ri, _, base_uid in rows]
+        )
+
         items = []
-        for ri, med_name in rows:
+        for ri, med_name, base_uid in rows:
+            uid = ri.unit_id or base_uid
             ordered = _approved_qty(ri)
             received = ri.received_quantity or 0
             items.append(
@@ -801,6 +910,8 @@ class StockReceiptService:
                     requisition_item_id=ri.id,
                     medicine_id=ri.medicine_id,
                     medicine_name=med_name,
+                    unit_id=uid,
+                    unit_name=unit_map[uid].name if uid in unit_map else None,
                     quantity_ordered=ordered,
                     quantity_received=received,
                     quantity_outstanding=max(ordered - received, 0),

@@ -26,13 +26,18 @@ class StockItemOut(BaseModel):
     name: str
     generic_name: Optional[str] = None
     category: Optional[str] = None
-    unit: str
+
+    # আগের `unit: str` এর বদলে এখন base_unit reference — stock সবসময় এই
+    # unit-এই (quantity) দেখানো হয়, কারণ StockBatch.quantity base_unit-এ থাকে
+    base_unit_id: int
+    base_unit_name: Optional[str] = None
+
     reorder_level: int
     is_active: bool
 
-    total_quantity: int = Field(description="All units on hand, including expired batches")
-    sellable_quantity: int = Field(description="Units on hand excluding expired batches")
-    expired_quantity: int = Field(description="Units in batches past their expiry date")
+    total_quantity: int = Field(description="All units on hand, including expired batches (base_unit-এ)")
+    sellable_quantity: int = Field(description="Units on hand excluding expired batches (base_unit-এ)")
+    expired_quantity: int = Field(description="Units in batches past their expiry date (base_unit-এ)")
     batch_count: int = Field(description="Number of batches with quantity > 0")
 
     purchase_value: Decimal = Field(description="SUM(quantity * purchase_price)")
@@ -85,3 +90,22 @@ class StockDetailOut(StockItemOut):
     """Medicine stock + batch-wise breakdown (FEFO order: earliest expiry first)."""
 
     batches: list[StockBatchOut]
+
+
+
+class StockAlertItemOut(StockItemOut):
+    """StockItemOut + কতটুকু ঘাটতি আছে সেটা।"""
+
+    alert_level: int = Field(description="এই medicine এর জন্য যে level ব্যবহার হয়েছে (reorder_level অথবা ?threshold)")
+    shortage: int = Field(description="alert_level এর কত নিচে আছে (already ঠিক থাকলে 0)")
+
+
+class StockAlertListOut(BaseModel):
+    items: list[StockAlertItemOut]
+    total: int
+    skip: int
+    limit: int
+    branch_id: Optional[int] = None
+    threshold: Optional[int] = Field(
+        default=None, description="সেট থাকলে বোঝাবে flat override ব্যবহার হয়েছে, না হলে যার যার reorder_level"
+    )

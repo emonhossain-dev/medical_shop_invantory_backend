@@ -1,12 +1,14 @@
 # app/services/stock_service.py
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from app.models.all_models import Medicine, StockBatch
+from app.models.all_models import Medicine, StockBatch, Unit
 from app.schemas.current_stock import (
     BatchStatus,
     StockBatchOut,
@@ -15,9 +17,18 @@ from app.schemas.current_stock import (
     StockListOut,
     StockStatus,
     StockSummaryOut,
+    StockAlertItemOut,
+    StockAlertListOut
 )
 
 EXPIRY_ALERT_DAYS = 30
+
+_BD_TZ = ZoneInfo("Asia/Dhaka")
+
+
+def _today_bd() -> date:
+    """Bangladesh calendar date (server may run in UTC)."""
+    return datetime.now(_BD_TZ).date()
 ZERO = Decimal("0.00")
 
 
@@ -75,7 +86,7 @@ class StockService:
         include_inactive: bool = False,
     ):
         """One row per medicine (LEFT JOIN so zero-stock medicines are included)."""
-        today = date.today()
+        today = _today_bd()
         not_expired = or_(StockBatch.expiry_date.is_(None), StockBatch.expiry_date >= today)
 
         total_qty = func.coalesce(func.sum(StockBatch.quantity), 0)
@@ -92,7 +103,8 @@ class StockService:
                 Medicine.name.label("name"),
                 Medicine.generic_name.label("generic_name"),
                 Medicine.category.label("category"),
-                Medicine.unit.label("unit"),
+                Medicine.base_unit_id.label("base_unit_id"),
+                Unit.name.label("unit"),
                 Medicine.reorder_level.label("reorder_level"),
                 Medicine.is_active.label("is_active"),
                 total_qty.label("total_quantity"),
@@ -103,9 +115,10 @@ class StockService:
                 nearest_expiry.label("nearest_expiry"),
             )
             .select_from(Medicine)
+            .join(Unit, Unit.id == Medicine.base_unit_id)
             .outerjoin(StockBatch, self._batch_join())
             .where(Medicine.store_id == self.store_id)
-            .group_by(Medicine.id)
+            .group_by(Medicine.id, Unit.name)
         )
 
         if not include_inactive:
@@ -137,6 +150,7 @@ class StockService:
             name=m["name"],
             generic_name=m["generic_name"],
             category=m["category"],
+            base_unit_id=m["base_unit_id"],
             unit=m["unit"],
             reorder_level=m["reorder_level"],
             is_active=m["is_active"],
@@ -204,7 +218,7 @@ class StockService:
         )
 
     async def summary(self) -> StockSummaryOut:
-        today = date.today()
+        today = _today_bd()
         grouped = self._grouped_stmt()[0].subquery()
 
         totals = (
@@ -263,7 +277,9 @@ class StockService:
     async def get_detail(self, medicine_id: int) -> Optional[StockDetailOut]:
         medicine = (
             await self.db.execute(
-                select(Medicine).where(
+                select(Medicine)
+                .options(selectinload(Medicine.base_unit))
+                .where(
                     Medicine.id == medicine_id, Medicine.store_id == self.store_id
                 )
             )
@@ -284,7 +300,7 @@ class StockService:
         )
         batches = (await self.db.execute(batch_stmt)).scalars().all()
 
-        today = date.today()
+        today = _today_bd()
         alert_limit = today + timedelta(days=self.expiry_alert_days)
 
         batch_out: list[StockBatchOut] = []
@@ -334,7 +350,8 @@ class StockService:
             name=medicine.name,
             generic_name=medicine.generic_name,
             category=medicine.category,
-            unit=medicine.unit,
+            base_unit_id=medicine.base_unit_id,
+            unit=medicine.base_unit.name,
             reorder_level=medicine.reorder_level,
             is_active=medicine.is_active,
             total_quantity=total,
@@ -346,4 +363,54 @@ class StockService:
             nearest_expiry=nearest_expiry,
             status=derive_stock_status(sellable, medicine.reorder_level),
             batches=batch_out,
+        )
+
+    async def list_alerts(
+            self,
+            *,
+            threshold: Optional[int] = None,
+            category: Optional[str] = None,
+            skip: int = 0,
+            limit: int = 50,
+    ) -> StockAlertListOut:
+        """
+        low_stock + out_of_stock medicine গুলোর তালিকা.
+        threshold=None -> যার যার reorder_level (default, recommended)
+        threshold=100  -> সবার জন্য flat 100
+        """
+        stmt, x = self._grouped_stmt(category=category, include_inactive=False)
+
+        level_expr = Medicine.reorder_level if threshold is None else threshold
+        stmt = stmt.having(x["sellable"] <= level_expr)
+
+        total = (
+            await self.db.execute(select(func.count()).select_from(stmt.subquery()))
+        ).scalar_one()
+
+        # সবচেয়ে urgent আগে: আগে out-of-stock, তারপর সবচেয়ে কম quantity
+        ordering = (
+            (x["sellable"] <= 0).desc(),
+            x["sellable"].asc(),
+            Medicine.name.asc(),
+        )
+        rows = (
+            await self.db.execute(stmt.order_by(*ordering).offset(skip).limit(limit))
+        ).mappings().all()
+
+        items = []
+        for r in rows:
+            item = self._row_to_item(r)
+            level = r["reorder_level"] if threshold is None else threshold
+            shortage = max(level - item.sellable_quantity, 0)
+            items.append(
+                StockAlertItemOut(**item.model_dump(), alert_level=level, shortage=shortage)
+            )
+
+        return StockAlertListOut(
+            items=items,
+            total=total,
+            skip=skip,
+            limit=limit,
+            branch_id=self.branch_id,
+            threshold=threshold,
         )

@@ -1,17 +1,9 @@
-"""
-app/routers/stock_adjustment.py
-
-Purchase return বাদে বাকি সব stock adjustment (damage, expiry, count_correction, other)।
-Purchase return এর জন্য POST /purchases/{purchase_id}/items/{item_id}/return ব্যবহার করো
-(app/routers/purchase.py এ)।
-"""
-
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.depends.deps import get_current_store_member, require_store_admin
+from app.depends.deps import get_current_store_member
 from app.models.all_models import (
     Medicine,
     StockAdjustment,
@@ -19,81 +11,40 @@ from app.models.all_models import (
     StockBatch,
     StoreMember,
 )
-from app.schemas.stock_adjustment import (
-    StockAdjustmentCreateRequest,
-    StockAdjustmentResponse,
-)
+from app.schemas.stock_adjustment import StockAdjustmentResponse
 
 router = APIRouter(prefix="/stock-adjustments", tags=["Stock Adjustments"])
 
 
-@router.post("", response_model=StockAdjustmentResponse, status_code=status.HTTP_201_CREATED)
-async def create_stock_adjustment(
-    payload: StockAdjustmentCreateRequest,
-    member: StoreMember = Depends(require_store_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    batch = await db.scalar(
-        select(StockBatch).where(
-            StockBatch.id == payload.stock_batch_id, StockBatch.store_id == member.store_id
-        )
-    )
-    if batch is None:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid stock_batch_id for this store")
+@router.post(
+    "",
+    status_code=status.HTTP_410_GONE,
+    deprecated=True,
+    include_in_schema=True,
+)
+async def create_stock_adjustment_deprecated():
+    """
+    এই endpoint দিয়ে আর নতুন stock adjustment তৈরি করা যাবে না।
 
-    new_quantity = batch.quantity + payload.quantity_change
-    if new_quantity < 0:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"Adjustment would make quantity negative (current: {batch.quantity}, "
-            f"change: {payload.quantity_change})",
-        )
-
-    batch.quantity = new_quantity
-
-    adjustment = StockAdjustment(
-        store_id=member.store_id,
-        branch_id=batch.branch_id,
-        medicine_id=batch.medicine_id,
-        stock_batch_id=batch.id,
-        reason=payload.reason,
-        quantity_change=payload.quantity_change,
-        unit_price=batch.purchase_price,
-        purchase_id=None,
-        purchase_item_id=None,
-        notes=payload.notes,
-        created_by=member.user_id,
-    )
-    db.add(adjustment)
-    await db.commit()
-    await db.refresh(adjustment)
-
-    medicine_name = await db.scalar(select(Medicine.name).where(Medicine.id == batch.medicine_id))
-
-    return StockAdjustmentResponse(
-        id=adjustment.id,
-        branch_id=adjustment.branch_id,
-        medicine_id=adjustment.medicine_id,
-        medicine_name=medicine_name,
-        stock_batch_id=adjustment.stock_batch_id,
-        batch_no=batch.batch_no,
-        reason=adjustment.reason,
-        quantity_change=adjustment.quantity_change,
-        unit_price=adjustment.unit_price,
-        purchase_id=adjustment.purchase_id,
-        purchase_item_id=adjustment.purchase_item_id,
-        notes=adjustment.notes,
-        created_by=adjustment.created_by,
-        created_at=adjustment.created_at,
-        batch_quantity_after=batch.quantity,
+    damage / expiry / count_correction এর জন্য POST /stock-releases ব্যবহার করো
+    (app/routers/stock_release.py)। purchase_return এর জন্য
+    POST /purchases/{purchase_id}/items/{item_id}/return ব্যবহার করো।
+    """
+    raise HTTPException(
+        status.HTTP_410_GONE,
+        "এই endpoint deprecated। damage/expiry/count_correction এর জন্য এখন "
+        "POST /stock-releases ব্যবহার করো; purchase_return এর জন্য "
+        "POST /purchases/{purchase_id}/items/{item_id}/return।",
     )
 
 
-@router.get("", response_model=list[StockAdjustmentResponse])
+@router.get("", response_model=list[StockAdjustmentResponse], deprecated=True)
 async def list_stock_adjustments(
     branch_id: int | None = Query(default=None),
     medicine_id: int | None = Query(default=None),
     reason: StockAdjustmentReason | None = Query(default=None),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
     member: StoreMember = Depends(get_current_store_member),
     db: AsyncSession = Depends(get_db),
 ):
@@ -112,7 +63,7 @@ async def list_stock_adjustments(
     if reason is not None:
         query = query.where(StockAdjustment.reason == reason)
 
-    result = await db.execute(query)
+    result = await db.execute(query.offset(skip).limit(limit))
 
     return [
         StockAdjustmentResponse(
