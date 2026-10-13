@@ -7,9 +7,25 @@ from sqlalchemy.ext.asyncio import (
 )
 
 Base = declarative_base()
-# pool_pre_ping: idle থাকার পর DB/NAT connection কেটে দিলে প্রথম request "connection is closed" এ ফেলত না
-# pool_recycle: লম্বা-জীবী connection ৩০ মিনিট পর নতুন করে
-engine = create_async_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=1800)
+
+# Render Postgres (external URL) সাধারণত SSL require করে।
+# Internal URL হলে SSL এর দরকার নেই, তখন connect_args বাদ দিলেও চলে।
+_connect_args = {}
+if DATABASE_URL and "asyncpg" in DATABASE_URL:
+    # local development এ SSL না দিলেও asyncpg কাজ করে,
+    # কিন্তু Render external URL এ SSL require হয়।
+    # .env এ DB_SSL=true দিলে force করা যাবে।
+    import os
+    if os.getenv("DB_SSL", "false").lower() in ("1", "true", "yes"):
+        _connect_args["ssl"] = True
+
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,      # idle-এ connection মরে গেলে প্রথম request fail করবে না
+    pool_recycle=1800,       # ৩০ মিনিট পর connection নতুন করে
+    connect_args=_connect_args,
+)
+
 AsyncSessionLocal = async_sessionmaker(
     engine,
     class_=AsyncSession,
