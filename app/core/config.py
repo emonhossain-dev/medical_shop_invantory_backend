@@ -3,11 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+asyncpg://postgres:123456@localhost:5432/medicine_store",
-    #"postgresql+asyncpg://medicine_inventory_3bk2_user:QcO9ijDrptI134qo0J6t7QPK4mvkg03o@dpg-da4lobrl550s738a7ro0-a.oregon-postgres.render.com/medicine_inventory_3bk2",
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET_KEY = os.getenv("SECRET_KEY", "SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
