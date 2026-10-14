@@ -132,8 +132,9 @@ async def _issue_tokens(db: AsyncSession, user: User, request: Request) -> UserT
 # ============================================================
 
 
-@router.post("/register", response_model=UserResponse)
+@router.post("/register", response_model=UserLoginResponse)
 async def register(
+    http_request: Request,
     full_name: str = Form(..., min_length=1, max_length=150),
     email: EmailStr = Form(...),
     phone: Optional[str] = Form(None, max_length=20),
@@ -169,9 +170,11 @@ async def register(
         await db.commit()
     except IntegrityError:
         await db.rollback()
+        delete_profile_image(image_url)  # DB save fail hole upload hoye jawa file clean up
         raise HTTPException(status_code=409, detail="Email or phone number is already registered")
     except Exception:
         await db.rollback()
+        delete_profile_image(image_url)
         raise HTTPException(status_code=400, detail="Internal Server Error")
 
     # refresh() relationship eager-load করে না, তাই selectinload দিয়ে আবার fetch করুন
@@ -182,7 +185,12 @@ async def register(
     )
     new_user = result.scalar_one()
 
-    return UserResponse.model_validate(new_user)
+    # _issue_tokens commit kore (ar commit er por attribute expire hoy),
+    # tai token issue korar AGE user response baniye nilam
+    user_response = UserResponse.model_validate(new_user)
+    token = await _issue_tokens(db, new_user, http_request)
+
+    return UserLoginResponse(user=user_response, token=token)
 
 
 @router.post("/login", response_model=UserLoginResponse)
@@ -347,7 +355,7 @@ async def update_profile(
 ):
     result = await db.execute(
         select(User)
-        .options(selectinload(User.store_memberships).selectinload(StoreMember.branch))  # আপনার relationship নাম অনুযায়ী
+        .options(selectinload(User.store_memberships).selectinload(StoreMember.branch))  # আপনার relationship নাম অনুযায়ী
         .where(User.id == current_user.id)
     )
     user = result.scalar_one_or_none()
